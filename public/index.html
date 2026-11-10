@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10141c">
+  <title>สนามประลองห้องเรียน</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section id="lobby" class="lobby">
+      <div class="brand"><span class="brand-mark">✦</span><span>CLASSROOM <b>ARENA</b></span></div>
+      <div class="hero">
+        <p class="eyebrow">เกมเอาตัวรอด · เล่นพร้อมกันได้ 50 คน</p>
+        <h1>พร้อมลงสนาม<br><span>หรือยัง?</span></h1>
+        <p class="intro">เลือกอาวุธ เอาตัวรอดจากวงที่บีบเข้ามา และเหลือชีวิตให้มากที่สุด</p>
+      </div>
+      <form id="join-form" class="join-card">
+        <label for="player-name">ชื่อผู้เล่น</label>
+        <input id="player-name" name="name" maxlength="20" placeholder="ใส่ชื่อของคุณ" autocomplete="nickname" required>
+        <label for="room-code">รหัสห้อง <span class="optional">(ถ้ามีลิงก์ ให้เปิดลิงก์นั้น)</span></label>
+        <input id="room-code" name="room" maxlength="8" placeholder="เช่น A3K9P" autocomplete="off">
+        <button id="join-button" class="button button-primary" type="submit">เข้าร่วมห้อง</button>
+        <div class="divider"><span>หรือ</span></div>
+        <button id="create-button" class="button button-secondary" type="button">สร้างห้องใหม่</button>
+        <p id="lobby-error" class="error" role="status"></p>
+      </form>
+      <div class="how-to">
+        <h2>วิธีเล่น</h2>
+        <div><span>01</span> เคลื่อนที่ด้วย <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> หรือปุ่มลูกศร</div>
+        <div><span>02</span> เดินเก็บอาวุธ เล็งด้วยเมาส์ แล้วคลิกเพื่อยิง</div>
+        <div><span>03</span> อยู่ในวงปลอดภัย — มี 5 ชีวิต ระวังอาวุธบางชนิดด้อยกว่าปืนเริ่มต้น</div>
+      </div>
+      <p class="footnote">เกมจำลองเพื่อการเรียนรู้ · เล่นผ่านเว็บเบราว์เซอร์บน PC</p>
+    </section>
+
+    <section id="game" class="game hidden">
+      <header class="game-header">
+        <div class="brand"><span class="brand-mark">✦</span><span>CLASSROOM <b>ARENA</b></span></div>
+        <div class="room-info">ห้อง <strong id="room-label">-----</strong><button id="copy-link" class="copy-button" type="button">คัดลอกลิงก์</button></div>
+      </header>
+      <div class="arena">
+        <canvas id="arena-canvas" aria-label="สนามประลอง"></canvas>
+        <canvas id="minimap" class="minimap" aria-label="แผนที่ย่อ"></canvas>
+        <aside id="leaderboard" class="leaderboard" aria-label="ตารางอันดับ">
+          <div class="leaderboard-heading"><span class="leaderboard-icon">♜</span><span>อันดับผู้เล่น</span><span id="rank-total" class="rank-total">0</span></div>
+          <div class="leaderboard-columns"><span>อันดับ</span><span>ผู้เล่น</span><span>สถานะ</span></div>
+          <div id="ranking-list" class="ranking-list"></div>
+        </aside>
+        <div class="hud hud-left">
+          <div class="hud-label">ชีวิต</div><div id="lives" class="hearts">♥ ♥ ♥ ♥ ♥</div>
+          <div class="weapon-label">อาวุธ</div><strong id="weapon-label">ปืนพกมาตรฐาน</strong>
+        </div>
+        <div class="hud hud-center">
+          <div id="countdown" class="countdown">รอเริ่มเกม</div>
+          <div id="players-count" class="players-count">ผู้เล่น 1 / 50</div>
+        </div>
+        <div class="hud hud-right"><span class="dot"></span> แผนที่ย่อ</div>
+        <div id="lobby-overlay" class="overlay">
+          <div class="overlay-card">
+            <p class="eyebrow">แชร์ลิงก์ชวนเพื่อนได้เลย</p>
+            <h2>ห้อง <span id="overlay-room">-----</span></h2>
+            <p id="waiting-text">กำลังรอผู้เล่นเข้าห้อง…</p>
+            <div id="player-list" class="player-list"></div>
+            <button id="start-button" class="button button-primary" type="button">เริ่มเกม</button>
+            <p class="overlay-hint">กดเริ่มได้เลย แม้มีผู้เล่นคนเดียว</p>
+          </div>
+        </div>
+        <div id="result-overlay" class="overlay hidden">
+          <div class="overlay-card result-card">
+            <p class="eyebrow">จบการแข่งขัน</p>
+            <h2 id="result-title">เกมจบแล้ว</h2>
+            <p id="result-message"></p>
+            <button id="back-button" class="button button-secondary" type="button">กลับหน้าหลัก</button>
+          </div>
+        </div>
+        <div id="toast" class="toast" role="status"></div>
+      </div>
+      <footer class="game-footer"><span>WASD / ลูกศร เคลื่อนที่</span><span>เมาส์เล็ง · คลิกยิง</span><span>เก็บอาวุธเพื่อเปลี่ยนปืน</span></footer>
+    </section>
+  </main>
+  <script src="/game.js" defer></script>
+</body>
+</html>
