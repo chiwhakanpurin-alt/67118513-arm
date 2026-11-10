@@ -32,6 +32,7 @@ const WEAPONS = [
 
 const rooms = new Map();
 const clients = new Map();
+let nextBulletId = 1;
 
 function randomPosition(minDistanceFromCenter = 0) {
   for (let attempt = 0; attempt < 30; attempt += 1) {
@@ -124,6 +125,8 @@ function joinRoom(socket, code, name) {
     name: String(name || "ผู้เล่น").trim().slice(0, 20) || "ผู้เล่น",
     x: position.x,
     y: position.y,
+    vx: 0,
+    vy: 0,
     angle: 0,
     weapon: 0,
     lives: 5,
@@ -132,6 +135,7 @@ function joinRoom(socket, code, name) {
     respawnAt: 0,
     nextShotAt: 0,
     nextZoneDamageAt: 0,
+    clientMovedAt: 0,
     input: { up: false, down: false, left: false, right: false, firing: false }
   };
   player.socket = socket;
@@ -143,7 +147,16 @@ function joinRoom(socket, code, name) {
     room: room.code,
     worldSize: WORLD_SIZE,
     maxPlayers: MAX_PLAYERS,
-    weapons: WEAPONS.map(({ name: weaponName }, index) => ({ id: index, name: weaponName }))
+    pickups: room.pickups,
+    weapons: WEAPONS.map((w, index) => ({
+      id: index,
+      name: w.name,
+      cooldown: w.cooldown,
+      speed: w.speed,
+      spread: w.spread,
+      pellets: w.pellets,
+      color: w.color
+    }))
   });
   notify(room, { type: "notice", text: `${player.name} เข้าร่วมห้องแล้ว` });
 }
@@ -178,14 +191,17 @@ function respawnPosition(zone) {
   };
 }
 
-function shoot(room, player, now) {
+function shoot(room, player, now, customAngles = null) {
   const weapon = WEAPONS[player.weapon] || WEAPONS[0];
   if (!player.alive || !player.input.firing || now < player.nextShotAt) return;
   player.nextShotAt = now + weapon.cooldown;
   for (let i = 0; i < weapon.pellets; i += 1) {
-    const angle = player.angle + (Math.random() - 0.5) * weapon.spread;
+    const rawAngle = Array.isArray(customAngles) && Number.isFinite(customAngles[i])
+      ? customAngles[i]
+      : player.angle + (Math.random() - 0.5) * weapon.spread;
+    const angle = Math.atan2(Math.sin(rawAngle), Math.cos(rawAngle));
     room.bullets.push({
-      id: randomUUID(),
+      id: nextBulletId++,
       owner: player.id,
       x: player.x + Math.cos(angle) * (PLAYER_RADIUS + 7),
       y: player.y + Math.sin(angle) * (PLAYER_RADIUS + 7),
@@ -206,6 +222,8 @@ function tickRoom(room, now) {
   const zone = zoneFor(room, now);
   for (const player of room.players.values()) {
     if (!player.alive) {
+      player.vx = 0;
+      player.vy = 0;
       if (player.lives > 0 && now >= player.respawnAt) {
         const position = respawnPosition(zone);
         player.x = position.x;
@@ -213,6 +231,7 @@ function tickRoom(room, now) {
         player.alive = true;
         player.weapon = 0;
         player.respawnAt = 0;
+        player.clientMovedAt = 0;
         player.nextZoneDamageAt = now + 1000;
         send(player.socket, { type: "notice", text: `เกิดใหม่แล้ว เหลือ ${player.lives} ชีวิต` });
       }
@@ -223,8 +242,12 @@ function tickRoom(room, now) {
     const dy = Number(player.input.down) - Number(player.input.up);
     const length = Math.hypot(dx, dy) || 1;
     const speed = 250;
-    player.x = Math.max(PLAYER_RADIUS, Math.min(WORLD_SIZE - PLAYER_RADIUS, player.x + (dx / length) * speed * delta));
-    player.y = Math.max(PLAYER_RADIUS, Math.min(WORLD_SIZE - PLAYER_RADIUS, player.y + (dy / length) * speed * delta));
+    player.vx = dx ? (dx / length) * speed : 0;
+    player.vy = dy ? (dy / length) * speed : 0;
+    if (now - player.clientMovedAt > 90) {
+      player.x = Math.max(PLAYER_RADIUS, Math.min(WORLD_SIZE - PLAYER_RADIUS, player.x + player.vx * delta));
+      player.y = Math.max(PLAYER_RADIUS, Math.min(WORLD_SIZE - PLAYER_RADIUS, player.y + player.vy * delta));
+    }
     if (Math.hypot(player.x - zone.x, player.y - zone.y) > zone.radius && now >= player.nextZoneDamageAt) {
       loseLife(room, player, now);
       player.nextZoneDamageAt = now + 1000;
@@ -243,6 +266,7 @@ function tickRoom(room, now) {
         const position = randomPosition();
         room.pickups.push({ x: position.x, y: position.y, weapon: Math.floor(Math.random() * WEAPONS.length) });
       }
+      room.pickupsDirty = true;
     }
   }
 
@@ -292,7 +316,7 @@ function finalizePlacements(room, survivors = [...room.players.values()].filter(
 
 function snapshot(room, now) {
   const zone = zoneFor(room, now);
-  return {
+  const stateMsg = {
     type: "state",
     started: room.startedAt !== null,
     gameOver: room.gameOver,
@@ -304,11 +328,13 @@ function snapshot(room, now) {
       radius: Math.round(zone.radius * 10) / 10,
       remaining: Math.round(zone.remaining * 10) / 10
     },
-    players: [...room.players.values()].map(({ id, name, x, y, angle, weapon, lives, alive, respawnAt, placement }) => ({
+    players: [...room.players.values()].map(({ id, name, x, y, vx, vy, angle, weapon, lives, alive, respawnAt, placement }) => ({
       id,
       name,
       x: Math.round(x * 10) / 10,
       y: Math.round(y * 10) / 10,
+      vx: Math.round(vx || 0),
+      vy: Math.round(vy || 0),
       angle: Math.round(angle * 1000) / 1000,
       weapon,
       lives,
@@ -316,8 +342,9 @@ function snapshot(room, now) {
       placement,
       respawnIn: alive ? 0 : Math.max(0, respawnAt - now)
     })),
-    pickups: room.pickups,
-    bullets: room.bullets.map(({ x, y, vx, vy, color }) => ({
+    bullets: room.bullets.map(({ id, owner, x, y, vx, vy, color }) => ({
+      id,
+      owner,
       x: Math.round(x * 10) / 10,
       y: Math.round(y * 10) / 10,
       vx: Math.round(vx),
@@ -325,6 +352,11 @@ function snapshot(room, now) {
       color
     }))
   };
+  if (room.pickupsDirty) {
+    stateMsg.pickups = room.pickups;
+    room.pickupsDirty = false;
+  }
+  return stateMsg;
 }
 
 const server = http.createServer((request, response) => {
@@ -347,8 +379,9 @@ const server = http.createServer((request, response) => {
   });
 });
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
 wss.on("connection", (socket) => {
+  socket._socket?.setNoDelay(true);
   socket.on("message", (raw) => {
     let message;
     try {
@@ -393,8 +426,19 @@ wss.on("connection", (socket) => {
         firing: Boolean(input.firing)
       };
       if (Number.isFinite(message.angle)) player.angle = Math.atan2(Math.sin(message.angle), Math.cos(message.angle));
-      if (room.startedAt !== null && player.alive && player.input.firing) {
-        shoot(room, player, Date.now());
+      if (room.startedAt !== null && player.alive) {
+        const now = Date.now();
+        if (Number.isFinite(message.x) && Number.isFinite(message.y)) {
+          const dist = Math.hypot(message.x - player.x, message.y - player.y);
+          if (dist <= 160) {
+            player.x = Math.max(PLAYER_RADIUS, Math.min(WORLD_SIZE - PLAYER_RADIUS, message.x));
+            player.y = Math.max(PLAYER_RADIUS, Math.min(WORLD_SIZE - PLAYER_RADIUS, message.y));
+            player.clientMovedAt = now;
+          }
+        }
+        if (player.input.firing) {
+          shoot(room, player, now, message.shots);
+        }
       }
     }
   });
@@ -417,7 +461,7 @@ setInterval(() => {
       maxPlayers: MAX_PLAYERS
     });
   }
-}, 33);
+}, 20);
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Classroom Battle is running on port ${PORT}`);

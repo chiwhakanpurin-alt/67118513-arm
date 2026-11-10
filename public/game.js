@@ -33,10 +33,19 @@ let groundPattern;
 let mapFeatures = [];
 let soldierSprites = [];
 let weaponSprites = [];
+let pickupSprites = [];
+let glowSprite = null;
+let vignetteCanvas = null;
+let minimapBgCanvas = null;
+let cachedPickups = [];
 let rankingSignature = "";
 let renderPlayers = new Map();
+let localBullets = [];
+let remoteBullets = new Map();
+let nextLocalShotAt = 0;
 let lastFrameTime = performance.now();
 let localAngle = 0;
+let lastHud = { count: "", countdown: "", lives: "", weapon: "" };
 
 const params = new URLSearchParams(location.search);
 if (params.has("room")) roomInput.value = params.get("room").toUpperCase();
@@ -61,6 +70,7 @@ function openConnection(action, name, code) {
       myId = message.id;
       roomCode = message.room;
       weapons = message.weapons;
+      cachedPickups = message.pickups || [];
       initializeGraphics(roomCode, message.worldSize);
       history.replaceState(null, "", `?room=${encodeURIComponent(roomCode)}`);
       document.querySelector("#room-label").textContent = roomCode;
@@ -68,18 +78,38 @@ function openConnection(action, name, code) {
       lobby.classList.add("hidden");
       game.classList.remove("hidden");
       resizeCanvas();
+      lastFrameTime = performance.now();
       requestAnimationFrame(draw);
     } else if (message.type === "lobby") {
       state = message;
       updateLobby(message);
     } else if (message.type === "state") {
-      if (state?.players) {
-        for (const p of message.players) {
-          const prev = renderPlayers.get(p.id);
-          if (!prev || !p.alive || Math.hypot(p.x - prev.x, p.y - prev.y) > 140) {
-            renderPlayers.set(p.id, { x: p.x, y: p.y, angle: p.angle });
-          }
+      if (message.pickups) cachedPickups = message.pickups;
+      message.pickups = cachedPickups;
+      for (const p of message.players) {
+        const prev = renderPlayers.get(p.id);
+        if (!prev || !p.alive || !prev.alive || Math.hypot(p.x - prev.x, p.y - prev.y) > 180) {
+          renderPlayers.set(p.id, { x: p.x, y: p.y, angle: p.angle, alive: p.alive });
+        } else {
+          prev.alive = p.alive;
         }
+      }
+      const activeBulletIds = new Set();
+      for (const b of message.bullets) {
+        if (b.owner === myId) continue;
+        activeBulletIds.add(b.id);
+        const existing = remoteBullets.get(b.id);
+        if (!existing) {
+          remoteBullets.set(b.id, { ...b });
+        } else {
+          existing.x += (b.x - existing.x) * 0.3;
+          existing.y += (b.y - existing.y) * 0.3;
+          existing.vx = b.vx;
+          existing.vy = b.vy;
+        }
+      }
+      for (const id of remoteBullets.keys()) {
+        if (!activeBulletIds.has(id)) remoteBullets.delete(id);
       }
       state = message;
       updateHud(message);
@@ -157,15 +187,31 @@ function updateLobby(lobbyState) {
 
 function updateHud(gameState) {
   const me = gameState.players.find((player) => player.id === myId);
-  document.querySelector("#players-count").textContent = `ผู้เล่น ${gameState.players.filter((player) => player.lives > 0).length} / 50`;
+  const countText = `ผู้เล่น ${gameState.players.filter((player) => player.lives > 0).length} / 50`;
+  if (countText !== lastHud.count) {
+    lastHud.count = countText;
+    document.querySelector("#players-count").textContent = countText;
+  }
   updateLeaderboard(gameState);
-  document.querySelector("#countdown").textContent = `${Math.floor(gameState.zone.remaining / 60)}:${String(Math.floor(gameState.zone.remaining % 60)).padStart(2, "0")}`;
+  let countdownText = `${Math.floor(gameState.zone.remaining / 60)}:${String(Math.floor(gameState.zone.remaining % 60)).padStart(2, "0")}`;
   if (me) {
-    document.querySelector("#lives").textContent = `${"♥ ".repeat(me.lives)}${"♡ ".repeat(5 - me.lives)}`.trim();
-    document.querySelector("#weapon-label").textContent = weapons[me.weapon]?.name || "ปืนพกมาตรฐาน";
-    if (!me.alive && me.lives > 0) {
-      document.querySelector("#countdown").textContent = `เกิดใหม่ ${Math.ceil(me.respawnIn / 1000)}s`;
+    const livesText = `${"♥ ".repeat(me.lives)}${"♡ ".repeat(5 - me.lives)}`.trim();
+    if (livesText !== lastHud.lives) {
+      lastHud.lives = livesText;
+      document.querySelector("#lives").textContent = livesText;
     }
+    const weaponText = weapons[me.weapon]?.name || "ปืนพกมาตรฐาน";
+    if (weaponText !== lastHud.weapon) {
+      lastHud.weapon = weaponText;
+      document.querySelector("#weapon-label").textContent = weaponText;
+    }
+    if (!me.alive && me.lives > 0) {
+      countdownText = `เกิดใหม่ ${Math.ceil(me.respawnIn / 1000)}s`;
+    }
+  }
+  if (countdownText !== lastHud.countdown) {
+    lastHud.countdown = countdownText;
+    document.querySelector("#countdown").textContent = countdownText;
   }
   if (gameState.started) document.querySelector("#lobby-overlay").classList.add("hidden");
   if (gameState.gameOver) showResult(gameState.winnerId);
@@ -234,6 +280,38 @@ function resizeCanvas() {
   minimap.width = Math.round(mapRect.width * ratio);
   minimap.height = Math.round(mapRect.height * ratio);
   mapContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+  buildVignetteCache(rect.width, rect.height);
+  if (state?.worldSize && mapFeatures.length) {
+    buildMinimapBgCache(mapRect.width, mapRect.height, state.worldSize);
+  }
+}
+
+function trySpawnLocalShot(now = performance.now()) {
+  if (!firing || !state?.started || state.gameOver || now < nextLocalShotAt) return null;
+  const me = state.players.find((player) => player.id === myId);
+  const renderedMe = renderPlayers.get(myId) || me;
+  if (!me?.alive || !renderedMe) return null;
+  const weapon = weapons[me.weapon] || weapons[0] || { cooldown: 420, speed: 620, spread: 0.035, pellets: 1, color: "#ffe08a" };
+  nextLocalShotAt = now + (weapon.cooldown || 420);
+  const baseAngle = computeLocalAngle();
+  const pellets = weapon.pellets || 1;
+  const spread = weapon.spread ?? 0.035;
+  const speed = weapon.speed || 620;
+  const color = weapon.color || "#ffe08a";
+  const shots = [];
+  for (let i = 0; i < pellets; i += 1) {
+    const angle = baseAngle + (Math.random() - 0.5) * spread;
+    shots.push(Math.round(angle * 1000) / 1000);
+    localBullets.push({
+      x: renderedMe.x + Math.cos(angle) * 25,
+      y: renderedMe.y + Math.sin(angle) * 25,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      color,
+      life: 1.8
+    });
+  }
+  return shots;
 }
 
 function computeLocalAngle() {
@@ -246,10 +324,12 @@ function computeLocalAngle() {
   return localAngle;
 }
 
-function sendInputNow() {
+function sendInputNow(customShots = null) {
   if (socket?.readyState !== WebSocket.OPEN || !myId || !state?.started) return;
   const angle = computeLocalAngle();
-  socket.send(JSON.stringify({
+  const renderedMe = renderPlayers.get(myId);
+  const shots = customShots || (firing ? trySpawnLocalShot() : null);
+  const payload = {
     type: "input",
     input: {
       up: keys.has("w") || keys.has("arrowup"),
@@ -259,7 +339,13 @@ function sendInputNow() {
       firing
     },
     angle: Math.round(angle * 1000) / 1000
-  }));
+  };
+  if (renderedMe) {
+    payload.x = Math.round(renderedMe.x * 10) / 10;
+    payload.y = Math.round(renderedMe.y * 10) / 10;
+  }
+  if (shots) payload.shots = shots;
+  socket.send(JSON.stringify(payload));
 }
 
 window.addEventListener("resize", resizeCanvas);
@@ -298,9 +384,9 @@ window.addEventListener("mouseup", () => {
 });
 arena.addEventListener("contextmenu", (event) => event.preventDefault());
 
-setInterval(sendInputNow, 33);
+setInterval(sendInputNow, 25);
 
-function stepSmoothState(dt) {
+function stepSmoothState(dt, now) {
   if (!state?.started) return;
   const worldSize = state.worldSize || 3000;
   const activeIds = new Set();
@@ -308,13 +394,14 @@ function stepSmoothState(dt) {
     activeIds.add(player.id);
     let rendered = renderPlayers.get(player.id);
     if (!rendered) {
-      rendered = { x: player.x, y: player.y, angle: player.angle };
+      rendered = { x: player.x, y: player.y, angle: player.angle, alive: player.alive };
       renderPlayers.set(player.id, rendered);
     }
     if (!player.alive) {
       rendered.x = player.x;
       rendered.y = player.y;
       rendered.angle = player.angle;
+      rendered.alive = false;
       continue;
     }
     if (player.id === myId) {
@@ -325,24 +412,45 @@ function stepSmoothState(dt) {
         rendered.x = Math.max(18, Math.min(worldSize - 18, rendered.x + (dx / len) * 250 * dt));
         rendered.y = Math.max(18, Math.min(worldSize - 18, rendered.y + (dy / len) * 250 * dt));
       }
-      const blend = Math.min(1, dt * 10);
-      rendered.x += (player.x - rendered.x) * blend;
-      rendered.y += (player.y - rendered.y) * blend;
       rendered.angle = computeLocalAngle();
     } else {
-      const blend = Math.min(1, dt * 16);
+      rendered.x += (player.vx || 0) * dt;
+      rendered.y += (player.vy || 0) * dt;
+      const blend = Math.min(1, dt * 14);
       rendered.x += (player.x - rendered.x) * blend;
       rendered.y += (player.y - rendered.y) * blend;
       const diff = Math.atan2(Math.sin(player.angle - rendered.angle), Math.cos(player.angle - rendered.angle));
-      rendered.angle += diff * Math.min(1, dt * 20);
+      rendered.angle += diff * Math.min(1, dt * 22);
     }
   }
   for (const id of renderPlayers.keys()) {
     if (!activeIds.has(id)) renderPlayers.delete(id);
   }
-  for (const bullet of state.bullets) {
-    bullet.x += bullet.vx * dt;
-    bullet.y += bullet.vy * dt;
+  if (firing) {
+    const shots = trySpawnLocalShot(now);
+    if (shots) sendInputNow(shots);
+  }
+  for (let i = localBullets.length - 1; i >= 0; i -= 1) {
+    const b = localBullets[i];
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    let hit = b.life <= 0 || b.x < 0 || b.y < 0 || b.x > worldSize || b.y > worldSize;
+    if (!hit) {
+      for (const target of state.players) {
+        if (!target.alive || target.id === myId) continue;
+        const rt = renderPlayers.get(target.id) || target;
+        if (Math.hypot(rt.x - b.x, rt.y - b.y) <= 23) {
+          hit = true;
+          break;
+        }
+      }
+    }
+    if (hit) localBullets.splice(i, 1);
+  }
+  for (const b of remoteBullets.values()) {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
   }
 }
 
@@ -359,7 +467,7 @@ function draw(now = performance.now()) {
     requestAnimationFrame(draw);
     return;
   }
-  stepSmoothState(dt);
+  stepSmoothState(dt, now);
   const me = state.players.find((player) => player.id === myId);
   const renderedMe = renderPlayers.get(myId) || me;
   if (renderedMe) {
@@ -372,12 +480,13 @@ function draw(now = performance.now()) {
   drawRoads(state.worldSize);
   drawMapFeatures(width, height);
   drawZone(state.zone);
-  for (const pickup of state.pickups) drawPickup(pickup);
-  for (const bullet of state.bullets) drawBullet(bullet);
-  for (const player of state.players) drawPlayer(player);
+  for (const pickup of cachedPickups) drawPickup(pickup, width, height);
+  for (const bullet of localBullets) drawBullet(bullet, width, height);
+  for (const bullet of remoteBullets.values()) drawBullet(bullet, width, height);
+  for (const player of state.players) drawPlayer(player, width, height);
   context.restore();
   drawVignette(width, height);
-  drawPlayerGlow(me && renderedMe ? { ...me, x: renderedMe.x, y: renderedMe.y } : me, width, height);
+  drawPlayerGlow(me && renderedMe ? { ...me, x: renderedMe.x, y: renderedMe.y } : me);
   drawMinimap();
   requestAnimationFrame(draw);
 }
@@ -386,6 +495,8 @@ function initializeGraphics(seed, worldSize) {
   groundPattern = createGroundPattern();
   soldierSprites = ARMOR_PALETTES.map(createSoldierSprite);
   weaponSprites = weapons.map((weapon, index) => createWeaponSprite(index, weapon.name));
+  pickupSprites = weapons.map((_, index) => createPickupSprite(index));
+  glowSprite = createGlowSprite();
 
   let value = 2166136261;
   for (const character of seed) value = Math.imul(value ^ character.charCodeAt(0), 16777619);
@@ -403,6 +514,78 @@ function initializeGraphics(seed, worldSize) {
     rotation: random() * Math.PI * 2,
     type: random()
   }));
+  const mapRect = minimap.getBoundingClientRect();
+  if (mapRect.width > 0) buildMinimapBgCache(mapRect.width, mapRect.height, worldSize);
+}
+
+function createPickupSprite(index) {
+  const sprite = document.createElement("canvas");
+  sprite.width = 36;
+  sprite.height = 36;
+  const ctx = sprite.getContext("2d");
+  ctx.translate(18, 18);
+  ctx.fillStyle = "#13171288";
+  ctx.beginPath();
+  ctx.ellipse(2, 9, 14, 8, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#c89448";
+  ctx.fillRect(-11, -8, 22, 19);
+  ctx.fillStyle = "#ecc27c";
+  ctx.fillRect(-11, -8, 22, 4);
+  ctx.fillStyle = "#51422e";
+  ctx.fillRect(-2, -8, 4, 19);
+  ctx.strokeStyle = "#171a17";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(-11, -8, 22, 19);
+  ctx.fillStyle = "#f1d89f";
+  ctx.font = "bold 9px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(`${index + 1}`, 0, 3);
+  return sprite;
+}
+
+function createGlowSprite() {
+  const sprite = document.createElement("canvas");
+  sprite.width = 500;
+  sprite.height = 500;
+  const ctx = sprite.getContext("2d");
+  const light = ctx.createRadialGradient(250, 250, 14, 250, 250, 250);
+  light.addColorStop(0, "#e3d8ad1c");
+  light.addColorStop(1, "#d5c69500");
+  ctx.fillStyle = light;
+  ctx.fillRect(0, 0, 500, 500);
+  return sprite;
+}
+
+function buildVignetteCache(width, height) {
+  if (width <= 0 || height <= 0) return;
+  vignetteCanvas = document.createElement("canvas");
+  vignetteCanvas.width = Math.round(width);
+  vignetteCanvas.height = Math.round(height);
+  const ctx = vignetteCanvas.getContext("2d");
+  const gradient = ctx.createRadialGradient(width / 2, height / 2, Math.min(width, height) * 0.24, width / 2, height / 2, Math.max(width, height) * 0.72);
+  gradient.addColorStop(0, "#10140c00");
+  gradient.addColorStop(1, "#0b0d0c55");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, width, height);
+}
+
+function buildMinimapBgCache(width, height, worldSize) {
+  if (width <= 0 || height <= 0 || !worldSize) return;
+  minimapBgCanvas = document.createElement("canvas");
+  minimapBgCanvas.width = Math.round(width);
+  minimapBgCanvas.height = Math.round(height);
+  const ctx = minimapBgCanvas.getContext("2d");
+  ctx.fillStyle = "#17221c";
+  ctx.fillRect(0, 0, width, height);
+  const scale = width / worldSize;
+  ctx.fillStyle = "#514c3e";
+  ctx.fillRect(worldSize * 0.35 * scale - 2, 0, 4, height);
+  ctx.fillRect(0, worldSize * 0.66 * scale - 2, width, 4);
+  for (const feature of mapFeatures) {
+    ctx.fillStyle = feature.type < 0.28 ? "#6d6c5a88" : feature.type < 0.59 ? "#85817488" : "#47544388";
+    ctx.fillRect(feature.x * scale, feature.y * scale, 1.5, 1.5);
+  }
 }
 
 function createGroundPattern() {
@@ -708,30 +891,16 @@ function drawZone(zone) {
   context.restore();
 }
 
-function drawPickup(pickup) {
-  context.save();
-  context.translate(pickup.x, pickup.y);
-  context.fillStyle = "#13171288";
-  context.beginPath();
-  context.ellipse(2, 9, 14, 8, 0, 0, Math.PI * 2);
-  context.fill();
-  context.fillStyle = "#c89448";
-  context.fillRect(-11, -8, 22, 19);
-  context.fillStyle = "#ecc27c";
-  context.fillRect(-11, -8, 22, 4);
-  context.fillStyle = "#51422e";
-  context.fillRect(-2, -8, 4, 19);
-  context.strokeStyle = "#171a17";
-  context.lineWidth = 2;
-  context.strokeRect(-11, -8, 22, 19);
-  context.restore();
-  context.fillStyle = "#f1d89f";
-  context.font = "bold 9px sans-serif";
-  context.textAlign = "center";
-  context.fillText(`${pickup.weapon + 1}`, pickup.x, pickup.y + 3);
+function drawPickup(pickup, width, height) {
+  if (pickup.x < camera.x - 24 || pickup.x > camera.x + width + 24 || pickup.y < camera.y - 24 || pickup.y > camera.y + height + 24) return;
+  const sprite = pickupSprites[pickup.weapon] || pickupSprites[0];
+  if (sprite) {
+    context.drawImage(sprite, pickup.x - 18, pickup.y - 18);
+  }
 }
 
-function drawBullet(bullet) {
+function drawBullet(bullet, width, height) {
+  if (bullet.x < camera.x - 24 || bullet.x > camera.x + width + 24 || bullet.y < camera.y - 24 || bullet.y > camera.y + height + 24) return;
   context.strokeStyle = `${bullet.color}99`;
   context.lineWidth = 2;
   context.beginPath();
@@ -748,11 +917,12 @@ function drawBullet(bullet) {
   context.fill();
 }
 
-function drawPlayer(player) {
+function drawPlayer(player, width, height) {
   if (!player.alive) return;
   const rendered = renderPlayers.get(player.id) || player;
   const px = rendered.x;
   const py = rendered.y;
+  if (px < camera.x - 45 || px > camera.x + width + 45 || py < camera.y - 45 || py > camera.y + height + 45) return;
   const pangle = rendered.angle;
   const index = state.players.findIndex((item) => item.id === player.id);
   const paletteIndex = index % ARMOR_PALETTES.length;
@@ -784,40 +954,32 @@ function drawPlayer(player) {
 }
 
 function drawVignette(width, height) {
-  const gradient = context.createRadialGradient(width / 2, height / 2, Math.min(width, height) * 0.24, width / 2, height / 2, Math.max(width, height) * 0.72);
-  gradient.addColorStop(0, "#10140c00");
-  gradient.addColorStop(1, "#0b0d0c55");
-  context.fillStyle = gradient;
-  context.fillRect(0, 0, width, height);
+  if (!vignetteCanvas || vignetteCanvas.width !== Math.round(width) || vignetteCanvas.height !== Math.round(height)) {
+    buildVignetteCache(width, height);
+  }
+  if (vignetteCanvas) context.drawImage(vignetteCanvas, 0, 0);
 }
 
-function drawPlayerGlow(player, width, height) {
-  if (!player?.alive) return;
+function drawPlayerGlow(player) {
+  if (!player?.alive || !glowSprite) return;
   const x = player.x - camera.x;
   const y = player.y - camera.y;
-  const light = context.createRadialGradient(x, y, 14, x, y, 250);
-  light.addColorStop(0, "#e3d8ad1c");
-  light.addColorStop(1, "#d5c69500");
-  context.globalCompositeOperation = "screen";
-  context.fillStyle = light;
-  context.fillRect(Math.max(0, x - 250), Math.max(0, y - 250), Math.min(500, width), Math.min(500, height));
-  context.globalCompositeOperation = "source-over";
+  context.drawImage(glowSprite, x - 250, y - 250);
 }
 
 function drawMinimap() {
   const width = minimap.clientWidth;
   const height = minimap.clientHeight;
-  mapContext.clearRect(0, 0, width, height);
-  mapContext.fillStyle = "#17221c";
-  mapContext.fillRect(0, 0, width, height);
-  const scale = width / state.worldSize;
-  mapContext.fillStyle = "#514c3e";
-  mapContext.fillRect(state.worldSize * 0.35 * scale - 2, 0, 4, height);
-  mapContext.fillRect(0, state.worldSize * 0.66 * scale - 2, width, 4);
-  for (const feature of mapFeatures) {
-    mapContext.fillStyle = feature.type < 0.28 ? "#6d6c5a88" : feature.type < 0.59 ? "#85817488" : "#47544388";
-    mapContext.fillRect(feature.x * scale, feature.y * scale, 1.5, 1.5);
+  if (!minimapBgCanvas || minimapBgCanvas.width !== Math.round(width)) {
+    buildMinimapBgCache(width, height, state.worldSize);
   }
+  if (minimapBgCanvas) {
+    mapContext.drawImage(minimapBgCanvas, 0, 0);
+  } else {
+    mapContext.fillStyle = "#17221c";
+    mapContext.fillRect(0, 0, width, height);
+  }
+  const scale = width / state.worldSize;
   mapContext.strokeStyle = "#edaf69";
   mapContext.lineWidth = 1.5;
   mapContext.beginPath();
@@ -825,9 +987,10 @@ function drawMinimap() {
   mapContext.stroke();
   for (const player of state.players) {
     if (!player.alive) continue;
+    const rp = renderPlayers.get(player.id) || player;
     mapContext.fillStyle = player.id === myId ? "#efffb6" : "#ff938d";
     mapContext.beginPath();
-    mapContext.arc(player.x * scale, player.y * scale, player.id === myId ? 3 : 2, 0, Math.PI * 2);
+    mapContext.arc(rp.x * scale, rp.y * scale, player.id === myId ? 3 : 2, 0, Math.PI * 2);
     mapContext.fill();
   }
 }
