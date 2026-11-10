@@ -35,8 +35,8 @@ const clients = new Map();
 
 function randomPosition(minDistanceFromCenter = 0) {
   for (let attempt = 0; attempt < 30; attempt += 1) {
-    const x = 70 + Math.random() * (WORLD_SIZE - 140);
-    const y = 70 + Math.random() * (WORLD_SIZE - 140);
+    const x = Math.round(70 + Math.random() * (WORLD_SIZE - 140));
+    const y = Math.round(70 + Math.random() * (WORLD_SIZE - 140));
     if (Math.hypot(x - WORLD_SIZE / 2, y - WORLD_SIZE / 2) >= minDistanceFromCenter) return { x, y };
   }
   return { x: WORLD_SIZE / 2, y: WORLD_SIZE / 2 };
@@ -72,7 +72,7 @@ function createRoom() {
   };
   for (let i = 0; i < 68; i += 1) {
     const position = randomPosition();
-    room.pickups.push({ id: randomUUID(), x: position.x, y: position.y, weapon: Math.floor(Math.random() * WEAPONS.length) });
+    room.pickups.push({ x: position.x, y: position.y, weapon: Math.floor(Math.random() * WEAPONS.length) });
   }
   rooms.set(code, room);
   return room;
@@ -83,7 +83,12 @@ function send(socket, message) {
 }
 
 function notify(room, message) {
-  for (const player of room.players.values()) send(player.socket, message);
+  const payload = JSON.stringify(message);
+  for (const player of room.players.values()) {
+    if (player.socket.readyState === WebSocket.OPEN && player.socket.bufferedAmount < 65536) {
+      player.socket.send(payload);
+    }
+  }
 }
 
 function leaveRoom(socket) {
@@ -236,7 +241,7 @@ function tickRoom(room, now) {
       send(player.socket, { type: "notice", text: `เก็บ ${WEAPONS[pickup.weapon].name} แล้ว` });
       if (room.pickups.length < 24) {
         const position = randomPosition();
-        room.pickups.push({ id: randomUUID(), x: position.x, y: position.y, weapon: Math.floor(Math.random() * WEAPONS.length) });
+        room.pickups.push({ x: position.x, y: position.y, weapon: Math.floor(Math.random() * WEAPONS.length) });
       }
     }
   }
@@ -293,12 +298,32 @@ function snapshot(room, now) {
     gameOver: room.gameOver,
     winnerId: room.winnerId,
     worldSize: WORLD_SIZE,
-    zone,
+    zone: {
+      x: zone.x,
+      y: zone.y,
+      radius: Math.round(zone.radius * 10) / 10,
+      remaining: Math.round(zone.remaining * 10) / 10
+    },
     players: [...room.players.values()].map(({ id, name, x, y, angle, weapon, lives, alive, respawnAt, placement }) => ({
-      id, name, x, y, angle, weapon, lives, alive, placement, respawnIn: alive ? 0 : Math.max(0, respawnAt - now)
+      id,
+      name,
+      x: Math.round(x * 10) / 10,
+      y: Math.round(y * 10) / 10,
+      angle: Math.round(angle * 1000) / 1000,
+      weapon,
+      lives,
+      alive,
+      placement,
+      respawnIn: alive ? 0 : Math.max(0, respawnAt - now)
     })),
     pickups: room.pickups,
-    bullets: room.bullets
+    bullets: room.bullets.map(({ x, y, vx, vy, color }) => ({
+      x: Math.round(x * 10) / 10,
+      y: Math.round(y * 10) / 10,
+      vx: Math.round(vx),
+      vy: Math.round(vy),
+      color
+    }))
   };
 }
 
@@ -368,25 +393,31 @@ wss.on("connection", (socket) => {
         firing: Boolean(input.firing)
       };
       if (Number.isFinite(message.angle)) player.angle = Math.atan2(Math.sin(message.angle), Math.cos(message.angle));
+      if (room.startedAt !== null && player.alive && player.input.firing) {
+        shoot(room, player, Date.now());
+      }
     }
   });
   socket.on("close", () => leaveRoom(socket));
   socket.on("error", () => leaveRoom(socket));
 });
 
+let lastLobbyBroadcast = 0;
 setInterval(() => {
   const now = Date.now();
+  const sendLobby = now - lastLobbyBroadcast >= 150;
+  if (sendLobby) lastLobbyBroadcast = now;
   for (const room of rooms.values()) {
     tickRoom(room, now);
     if (room.startedAt !== null) notify(room, snapshot(room, now));
-    else notify(room, {
+    else if (sendLobby) notify(room, {
       type: "lobby",
       room: room.code,
       players: [...room.players.values()].map(({ id, name }) => ({ id, name })),
       maxPlayers: MAX_PLAYERS
     });
   }
-}, 50);
+}, 33);
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Classroom Battle is running on port ${PORT}`);

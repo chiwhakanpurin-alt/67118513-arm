@@ -34,6 +34,9 @@ let mapFeatures = [];
 let soldierSprites = [];
 let weaponSprites = [];
 let rankingSignature = "";
+let renderPlayers = new Map();
+let lastFrameTime = performance.now();
+let localAngle = 0;
 
 const params = new URLSearchParams(location.search);
 if (params.has("room")) roomInput.value = params.get("room").toUpperCase();
@@ -70,6 +73,14 @@ function openConnection(action, name, code) {
       state = message;
       updateLobby(message);
     } else if (message.type === "state") {
+      if (state?.players) {
+        for (const p of message.players) {
+          const prev = renderPlayers.get(p.id);
+          if (!prev || !p.alive || Math.hypot(p.x - prev.x, p.y - prev.y) > 140) {
+            renderPlayers.set(p.id, { x: p.x, y: p.y, angle: p.angle });
+          }
+        }
+      }
       state = message;
       updateHud(message);
     } else if (message.type === "notice") {
@@ -225,28 +236,19 @@ function resizeCanvas() {
   mapContext.setTransform(ratio, 0, 0, ratio, 0, 0);
 }
 
-window.addEventListener("resize", resizeCanvas);
-window.addEventListener("keydown", (event) => {
-  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(event.key)) event.preventDefault();
-  keys.add(event.key.toLowerCase());
-});
-window.addEventListener("keyup", (event) => keys.delete(event.key.toLowerCase()));
-window.addEventListener("blur", () => { keys.clear(); firing = false; });
-arena.addEventListener("mousemove", (event) => {
+function computeLocalAngle() {
   const rect = arena.getBoundingClientRect();
-  mouse.x = event.clientX - rect.left;
-  mouse.y = event.clientY - rect.top;
-});
-arena.addEventListener("mousedown", () => { firing = true; });
-window.addEventListener("mouseup", () => { firing = false; });
-arena.addEventListener("contextmenu", (event) => event.preventDefault());
+  const renderedMe = renderPlayers.get(myId);
+  const me = renderedMe || state?.players?.find((player) => player.id === myId);
+  const screenX = me ? me.x - camera.x : rect.width / 2;
+  const screenY = me ? me.y - camera.y : rect.height / 2;
+  localAngle = Math.atan2(mouse.y - screenY, mouse.x - screenX);
+  return localAngle;
+}
 
-setInterval(() => {
+function sendInputNow() {
   if (socket?.readyState !== WebSocket.OPEN || !myId || !state?.started) return;
-  const me = state.players.find((player) => player.id === myId);
-  if (!me) return;
-  const rect = arena.getBoundingClientRect();
-  const angle = Math.atan2(mouse.y - rect.height / 2, mouse.x - rect.width / 2);
+  const angle = computeLocalAngle();
   socket.send(JSON.stringify({
     type: "input",
     input: {
@@ -256,12 +258,98 @@ setInterval(() => {
       right: keys.has("d") || keys.has("arrowright"),
       firing
     },
-    angle
+    angle: Math.round(angle * 1000) / 1000
   }));
-}, 50);
+}
 
-function draw() {
+window.addEventListener("resize", resizeCanvas);
+window.addEventListener("keydown", (event) => {
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(event.key)) event.preventDefault();
+  const key = event.key.toLowerCase();
+  if (!keys.has(key)) {
+    keys.add(key);
+    sendInputNow();
+  }
+});
+window.addEventListener("keyup", (event) => {
+  const key = event.key.toLowerCase();
+  if (keys.delete(key)) sendInputNow();
+});
+window.addEventListener("blur", () => {
+  keys.clear();
+  firing = false;
+  sendInputNow();
+});
+arena.addEventListener("mousemove", (event) => {
+  const rect = arena.getBoundingClientRect();
+  mouse.x = event.clientX - rect.left;
+  mouse.y = event.clientY - rect.top;
+  computeLocalAngle();
+});
+arena.addEventListener("mousedown", () => {
+  firing = true;
+  sendInputNow();
+});
+window.addEventListener("mouseup", () => {
+  if (firing) {
+    firing = false;
+    sendInputNow();
+  }
+});
+arena.addEventListener("contextmenu", (event) => event.preventDefault());
+
+setInterval(sendInputNow, 33);
+
+function stepSmoothState(dt) {
+  if (!state?.started) return;
+  const worldSize = state.worldSize || 3000;
+  const activeIds = new Set();
+  for (const player of state.players) {
+    activeIds.add(player.id);
+    let rendered = renderPlayers.get(player.id);
+    if (!rendered) {
+      rendered = { x: player.x, y: player.y, angle: player.angle };
+      renderPlayers.set(player.id, rendered);
+    }
+    if (!player.alive) {
+      rendered.x = player.x;
+      rendered.y = player.y;
+      rendered.angle = player.angle;
+      continue;
+    }
+    if (player.id === myId) {
+      const dx = (keys.has("d") || keys.has("arrowright") ? 1 : 0) - (keys.has("a") || keys.has("arrowleft") ? 1 : 0);
+      const dy = (keys.has("s") || keys.has("arrowdown") ? 1 : 0) - (keys.has("w") || keys.has("arrowup") ? 1 : 0);
+      if (dx !== 0 || dy !== 0) {
+        const len = Math.hypot(dx, dy);
+        rendered.x = Math.max(18, Math.min(worldSize - 18, rendered.x + (dx / len) * 250 * dt));
+        rendered.y = Math.max(18, Math.min(worldSize - 18, rendered.y + (dy / len) * 250 * dt));
+      }
+      const blend = Math.min(1, dt * 10);
+      rendered.x += (player.x - rendered.x) * blend;
+      rendered.y += (player.y - rendered.y) * blend;
+      rendered.angle = computeLocalAngle();
+    } else {
+      const blend = Math.min(1, dt * 16);
+      rendered.x += (player.x - rendered.x) * blend;
+      rendered.y += (player.y - rendered.y) * blend;
+      const diff = Math.atan2(Math.sin(player.angle - rendered.angle), Math.cos(player.angle - rendered.angle));
+      rendered.angle += diff * Math.min(1, dt * 20);
+    }
+  }
+  for (const id of renderPlayers.keys()) {
+    if (!activeIds.has(id)) renderPlayers.delete(id);
+  }
+  for (const bullet of state.bullets) {
+    bullet.x += bullet.vx * dt;
+    bullet.y += bullet.vy * dt;
+  }
+}
+
+function draw(now = performance.now()) {
   if (game.classList.contains("hidden")) return;
+  const dt = Math.min(0.05, Math.max(0, (now - lastFrameTime) / 1000));
+  lastFrameTime = now;
   const width = arena.clientWidth;
   const height = arena.clientHeight;
   context.clearRect(0, 0, width, height);
@@ -271,10 +359,12 @@ function draw() {
     requestAnimationFrame(draw);
     return;
   }
+  stepSmoothState(dt);
   const me = state.players.find((player) => player.id === myId);
-  if (me) {
-    camera.x = Math.max(0, Math.min(state.worldSize - width, me.x - width / 2));
-    camera.y = Math.max(0, Math.min(state.worldSize - height, me.y - height / 2));
+  const renderedMe = renderPlayers.get(myId) || me;
+  if (renderedMe) {
+    camera.x = Math.max(0, Math.min(state.worldSize - width, renderedMe.x - width / 2));
+    camera.y = Math.max(0, Math.min(state.worldSize - height, renderedMe.y - height / 2));
   }
   context.save();
   context.translate(-camera.x, -camera.y);
@@ -287,7 +377,7 @@ function draw() {
   for (const player of state.players) drawPlayer(player);
   context.restore();
   drawVignette(width, height);
-  drawPlayerGlow(me, width, height);
+  drawPlayerGlow(me && renderedMe ? { ...me, x: renderedMe.x, y: renderedMe.y } : me, width, height);
   drawMinimap();
   requestAnimationFrame(draw);
 }
@@ -648,22 +738,27 @@ function drawBullet(bullet) {
   context.moveTo(bullet.x - bullet.vx * 0.018, bullet.y - bullet.vy * 0.018);
   context.lineTo(bullet.x, bullet.y);
   context.stroke();
+  context.fillStyle = `${bullet.color}44`;
+  context.beginPath();
+  context.arc(bullet.x, bullet.y, 7, 0, Math.PI * 2);
+  context.fill();
   context.fillStyle = bullet.color;
-  context.shadowColor = bullet.color;
-  context.shadowBlur = 9;
   context.beginPath();
   context.arc(bullet.x, bullet.y, 4, 0, Math.PI * 2);
   context.fill();
-  context.shadowBlur = 0;
 }
 
 function drawPlayer(player) {
   if (!player.alive) return;
+  const rendered = renderPlayers.get(player.id) || player;
+  const px = rendered.x;
+  const py = rendered.y;
+  const pangle = rendered.angle;
   const index = state.players.findIndex((item) => item.id === player.id);
   const paletteIndex = index % ARMOR_PALETTES.length;
   context.save();
-  context.translate(player.x, player.y);
-  context.rotate(player.angle);
+  context.translate(px, py);
+  context.rotate(pangle);
   if (player.id === myId) {
     context.strokeStyle = "#d4e5acaa";
     context.lineWidth = 1.5;
@@ -678,13 +773,13 @@ function drawPlayer(player) {
   context.textAlign = "center";
   context.lineWidth = 3;
   context.strokeStyle = "#111512";
-  context.strokeText(player.name, player.x, player.y - 27);
+  context.strokeText(player.name, px, py - 27);
   context.fillStyle = "#f0eee3";
-  context.fillText(player.name, player.x, player.y - 23);
+  context.fillText(player.name, px, py - 23);
   if (player.id === myId) {
     context.font = "10px sans-serif";
     context.fillStyle = "#f0b5a3";
-    context.fillText("♥".repeat(player.lives), player.x, player.y + 33);
+    context.fillText("♥".repeat(player.lives), px, py + 33);
   }
 }
 
