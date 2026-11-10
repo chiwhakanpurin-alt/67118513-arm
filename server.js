@@ -221,7 +221,7 @@ function tickRoom(room, now) {
     player.x = Math.max(PLAYER_RADIUS, Math.min(WORLD_SIZE - PLAYER_RADIUS, player.x + (dx / length) * speed * delta));
     player.y = Math.max(PLAYER_RADIUS, Math.min(WORLD_SIZE - PLAYER_RADIUS, player.y + (dy / length) * speed * delta));
     if (Math.hypot(player.x - zone.x, player.y - zone.y) > zone.radius && now >= player.nextZoneDamageAt) {
-      loseLife(player, now);
+      loseLife(room, player, now);
       player.nextZoneDamageAt = now + 1000;
       if (player.lives > 0) {
         send(player.socket, { type: "notice", text: `อยู่นอกวงปลอดภัย! เสีย 1 ชีวิต เหลือ ${player.lives}` });
